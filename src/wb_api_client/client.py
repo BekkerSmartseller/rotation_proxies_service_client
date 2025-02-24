@@ -1,6 +1,6 @@
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import ProxyError, RequestException
-from typing import Optional, Dict, List, Any, Union, AsyncGenerator, Type,Set
+from typing import Optional, Dict, List, Any, Union, AsyncGenerator, Type,Set,Literal
 import asyncio
 import json
 import coloredlogs, logging
@@ -19,7 +19,7 @@ class ProxyClientCFFI:
         self,
         proxy_service_url: str,
         api_secret: str,
-        impersonate: str ="chrome99_android",
+        impersonate: Literal['chrome99_android', 'chrome133a', 'safari18_0', 'safari18_0_ios', 'firefox133'] = "chrome99_android",
         group_name: Optional[str] = None,
         priority_weights: Optional[Dict[str, int]] = None,
         # max_retries: int = 3
@@ -81,20 +81,68 @@ class ProxyClientCFFI:
         url: str, 
         response_type: Type[Struct] = None,
         strict: bool = True,
+        type_return_data: Literal['objects', 'dict'] = 'objects',
         timeout: float = 3.0,
         max_retries: int = 3,
         no_retry_statuses: Set[int] = None,
         no_retry_classes: Set[int] = None,
         base_delay: float = 0.0,
         exponential_factor: float = 2.0,
+        return_status_code: bool = False,
         **kwargs
-    ) -> Union[Struct, dict, list, None]:
+    ) -> Union[tuple[int, Any], Union[Struct, dict, list, None]]:
+        """
+        Выполняет асинхронный HTTP-запрос с использованием ротируемых прокси.
+
+        Параметры:
+            method (str): HTTP-метод (GET, POST и т.д.)
+            url (str): Целевой URL
+            response_type (Type[Struct], optional): Класс для десериализации ответа
+            strict (bool): Строгая валидация при десериализации
+            type_return_data (str): Формат возвращаемых данных ('objects'/'dict')
+            timeout (float): Таймаут запроса в секундах
+            max_retries (int): Максимальное количество попыток
+            no_retry_statuses (Set[int]): Статус-коды без повторных попыток
+            no_retry_classes (Set[int]): Классы статус-кодов для исключения
+            base_delay (float): Базовая задержка между попытками
+            exponential_factor (float): Множитель экспоненциальной задержки
+            return_status_code (bool): Если True, возвращает кортеж (status_code, data)
+            **kwargs: Дополнительные параметры запроса
+
+        Возвращает:
+            return_status_code (bool): Если True, возвращает кортеж (status_code, data)
+                где status_code - HTTP-код ответа или 0 при ошибках подключения
+                data - результат в указанном формате или None при ошибках
+            При return_status_code=True: tuple[int, Union[Struct, dict, list, None]]
+                Иначе: Union[Struct, dict, list, None]
+
+        Исключения:
+            RequestException: При превышении максимального числа попыток
+            msgspec.DecodeError: При ошибке десериализации
+        """
         # Инициализация декодера
         if response_type is not None:
             decoder = msgspec.json.Decoder(type=response_type, strict=strict)
         else:
             decoder = msgspec.json.Decoder()
+            # raw_data = msgspec.to_builtins(decoder.decode(raw_data_))
         
+        # # Обработка параметров запроса
+        method = method.upper()
+        if method in {"POST", "PUT", "PATCH"}:
+            # Кодируем тело запроса с помощью msgspec
+            if "params" in kwargs:
+                kwargs["data"] = msgspec.json.encode(kwargs.pop("params"))
+                if "headers" not in kwargs:
+                    kwargs["headers"] = {}
+                kwargs["headers"].setdefault("Content-Type", "application/json")
+        elif method in {"GET", "HEAD", "DELETE"}:
+            # Кодируем параметры URL с помощью msgspec
+            if "params" in kwargs:
+                params = kwargs.pop("params")
+                kwargs["params"] = msgspec.to_builtins(params)
+                kwargs["params"] = {k: v for k, v in kwargs["params"].items() if v is not None}
+
         # Генерация статус-кодов для классов
         status_classes = {
             4: set(range(400, 500)),
@@ -110,6 +158,8 @@ class ProxyClientCFFI:
         if no_retry_statuses:
             excluded_statuses.update(no_retry_statuses)
         
+        last_status_code = None
+        last_exception = None
         # Основной цикл попыток
         for attempt in range(1, max_retries + 1):
             delay = base_delay * (exponential_factor ** (attempt - 1))
@@ -125,32 +175,70 @@ class ProxyClientCFFI:
                     **kwargs
                 )
                 
-                # Проверка статус-кода
-                if response.status_code in excluded_statuses:
-                    logging.warning(f"Received excluded status {response.status_code}")
-                    return decoder.decode(response.content) if response.content else None
+                status_code = response.status_code
+                last_status_code = status_code
+            
+                # Обработка исключенных статусов
+                if status_code in excluded_statuses:
+                    logging.warning(f"Received excluded status {status_code}")
+                    result = decoder.decode(response.content) if response.content else None
+                    if return_status_code:
+                        return (status_code, result)
+                    return result
                 
                 response.raise_for_status()
+
+                # Обработка успешного ответа
+                if response_type is not None and type_return_data == 'objects':
+                    result = decoder.decode(response.content)
+                elif response_type is not None and type_return_data == 'dict':
+                    result = msgspec.to_builtins(decoder.decode(response.content))
+                else:
+                    result = decoder.decode(response.content)
                 
-                return decoder.decode(response.content)
-                
+                if return_status_code:
+                    return (status_code, result)
+                return result
+
             except (ProxyError, RequestException) as e:
-                # Обработка исключений с кодом статуса
-                status_code = getattr(e, 'code', None)
-                if status_code in excluded_statuses:
-                    logging.warning(f"Excluded status {status_code} received")
-                    return None
-                
-                logging.warning(f"Attempt {attempt} failed: {e}")
-                if attempt < self.max_retries:
-                    logging.info(f"Waiting {delay:.2f}s before next attempt")
+                # Получаем статус-код из объекта ответа
+                if hasattr(e, "response") and e.response is not None:
+                    last_status_code = e.response.status_code
+                else:
+                    # Парсим код из строки исключения для curl_cffi
+                    error_str = str(e)
+                    status_code = 0
+                    if "HTTP Error" in error_str:
+                        try:
+                            status_code = int(error_str.split(":")[0].split()[-1])
+                        except:
+                            pass
+                    last_status_code = status_code
+
+                last_exception = e
+
+                if last_status_code in excluded_statuses:
+                    logging.warning(f"Excluded status {last_status_code} received")
+                    break
+
+                logging.warning(f"Attempt {attempt} failed: {str(e)}")
+                if attempt < max_retries:
+                    logging.info(f"Retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
-                
+
             except msgspec.DecodeError as e:
-                logging.error(f"Decoding error: {e}")
-                return None
+                logging.error(f"Decoding failed: {str(e)}")
+                last_exception = e
+                break  # Прерываем цикл при ошибке десериализации
+
             except Exception as e:
-                logging.error(f"Request failed: {e}")
+                logging.error(f"Unexpected error: {str(e)}")
+                last_exception = e
                 raise
-                
-        raise RequestException(f"Max retries ({self.max_retries}) exceeded")
+
+        # Обработка результата после всех попыток
+        if return_status_code:
+            return (last_status_code or 0, None)
+        
+        if last_exception:
+            raise last_exception
