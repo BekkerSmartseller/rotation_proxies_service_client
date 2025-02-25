@@ -22,7 +22,6 @@ class ProxyClientCFFI:
         impersonate: Literal['chrome99_android', 'chrome133a', 'safari18_0', 'safari18_0_ios', 'firefox133'] = "chrome99_android",
         group_name: Optional[str] = None,
         priority_weights: Optional[Dict[str, int]] = None,
-        # max_retries: int = 3
     ):
         self.proxy_service_url = proxy_service_url
         self.headers = {"x-secret": api_secret}
@@ -30,7 +29,6 @@ class ProxyClientCFFI:
         self.group_name = group_name
         self.priority_weights = priority_weights
         self.session: Optional[AsyncSession] = None
-        # self.max_retries = max_retries
         self.params = self._build_params()
 
     async def __aenter__(self):
@@ -89,8 +87,9 @@ class ProxyClientCFFI:
         base_delay: float = 0.0,
         exponential_factor: float = 2.0,
         return_status_code: bool = False,
+        return_cookies: bool = False,
         **kwargs
-    ) -> Union[tuple[int, Any], Union[Struct, dict, list, None]]:
+    ) -> Union[tuple[int, Any], Union[Struct, dict, list, None], tuple[Any, dict], Any]:
         """
         Выполняет асинхронный HTTP-запрос с использованием ротируемых прокси.
 
@@ -107,14 +106,19 @@ class ProxyClientCFFI:
             base_delay (float): Базовая задержка между попытками
             exponential_factor (float): Множитель экспоненциальной задержки
             return_status_code (bool): Если True, возвращает кортеж (status_code, data)
+            return_cookies (bool): Если True, возвращает cookies в виде словаря
             **kwargs: Дополнительные параметры запроса
 
         Возвращает:
-            return_status_code (bool): Если True, возвращает кортеж (status_code, data)
+            При return_status_code=True и return_cookies=True: 
+                tupleUnion[tuple[int, Any], Union[Struct, dict, list, None], Any] - (status_code, data, cookies)
+            При return_status_code=True: возвращает кортеж (status_code, data)
                 где status_code - HTTP-код ответа или 0 при ошибках подключения
                 data - результат в указанном формате или None при ошибках
-            При return_status_code=True: tuple[int, Union[Struct, dict, list, None]]
-                Иначе: Union[Struct, dict, list, None]
+                tuple[int, Any]
+            При return_cookies=True: 
+                tuple[Any, dict]
+            Иначе: Any
 
         Исключения:
             RequestException: При превышении максимального числа попыток
@@ -158,6 +162,7 @@ class ProxyClientCFFI:
         if no_retry_statuses:
             excluded_statuses.update(no_retry_statuses)
         
+        last_cookies = None
         last_status_code = None
         last_exception = None
         # Основной цикл попыток
@@ -188,6 +193,10 @@ class ProxyClientCFFI:
                 
                 response.raise_for_status()
 
+                # Сохраняем cookies
+                if return_cookies:
+                    last_cookies = dict(response.cookies)
+
                 # Обработка успешного ответа
                 if response_type is not None and type_return_data == 'objects':
                     result = decoder.decode(response.content)
@@ -196,9 +205,16 @@ class ProxyClientCFFI:
                 else:
                     result = decoder.decode(response.content)
                 
-                if return_status_code:
-                    return (status_code, result)
-                return result
+                # if return_status_code:
+                #     return (status_code, result)
+                # return result
+                return self._format_return(
+                    result, 
+                    status_code, 
+                    last_cookies,
+                    return_status_code,
+                    return_cookies
+                )
 
             except (ProxyError, RequestException) as e:
                 # Получаем статус-код из объекта ответа
@@ -220,6 +236,10 @@ class ProxyClientCFFI:
                 if last_status_code in excluded_statuses:
                     logging.warning(f"Excluded status {last_status_code} received")
                     break
+                
+                # Сохраняем cookies из response если есть
+                if hasattr(e, "response") and e.response:
+                    last_cookies = dict(e.response.cookies) if return_cookies else None
 
                 logging.warning(f"Attempt {attempt} failed: {str(e)}")
                 if attempt < max_retries:
@@ -237,8 +257,29 @@ class ProxyClientCFFI:
                 raise
 
         # Обработка результата после всех попыток
-        if return_status_code:
-            return (last_status_code or 0, None)
+        # if return_status_code:
+        #     return (last_status_code or 0, None)
         
-        if last_exception:
-            raise last_exception
+        # if last_exception:
+        #     raise last_exception
+
+        # Обработка после всех попыток
+        return self._format_return(
+            None, 
+            last_status_code, 
+            last_cookies,
+            return_status_code,
+            return_cookies
+        )        
+        # raise RequestException(f"Max retries ({max_retries}) exceeded")
+    def _format_return(self, data, status_code, cookies, return_status, return_cookies):
+        """Форматирует возвращаемое значение в зависимости от флагов"""
+        
+        if return_status and return_cookies:
+            return (status_code or 0, data, cookies or {})
+        if return_status:
+            return (status_code or 0, data)
+        if return_cookies:
+            return (data, cookies or {})
+        return data
+
