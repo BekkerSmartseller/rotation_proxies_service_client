@@ -8,7 +8,8 @@ setup(
     install_requires=[
         "curl_cffi>=0.7.4",
         "msgspec>=0.18.6",
-        "coloredlogs>=15.0.1"
+        "coloredlogs>=15.0.1",
+        "redis>=5.0.1"
     ],
     python_requires=">=3.9",
     author="Your Team Name",
