@@ -1,7 +1,7 @@
-# rotation_proxies_service_client
+#rotation_proxies_service_client
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import ProxyError, RequestException
-from typing import Optional, Dict, List, Any, Union, AsyncGenerator, Type, Set, Literal
+from typing import Optional, Dict, List, Any, Union, AsyncGenerator, Type,Set,Literal
 from datetime import datetime, timedelta
 import time
 import random
@@ -11,13 +11,15 @@ import coloredlogs, logging
 import msgspec
 from msgspec import Struct, field
 from redis import asyncio as aioredis
-from redis import DataError
+from redis import  DataError
+
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level='DEBUG', logger=logger)
 logging.basicConfig(
     format="%(asctime)-15s [%(levelname)s] %(funcName)s: %(message)s",
     level=logging.INFO)
+
 
 class GetTokens:
     def __init__(self, token_redis_url: str):
@@ -36,6 +38,7 @@ class GetTokens:
                 health_check_interval=30
             )
             self.client = aioredis.Redis(connection_pool=self.pool)
+            # Проверка подключения
             await self.client.ping()
         except Exception as e:
             logger.error(f"Redis connection failed: {str(e)}")
@@ -64,6 +67,7 @@ class GetTokens:
             await self.connect()
 
         try:
+            # Используем SCAN вместо KEYS 
             cursor = b'0'
             all_keys = []
             while cursor:
@@ -72,6 +76,7 @@ class GetTokens:
             if not all_keys:
                 raise DataError("No tokens found in Redis")
 
+            # Пакетное получение значений
             tokens_data = await self.client.mget(all_keys)
             valid_tokens = []
             for data in tokens_data:
@@ -102,51 +107,7 @@ class GetTokens:
         required_fields = {'WBTokenV3', 'x-supplier-id', 'wbx-validation-key'}
         return all(field in token for field in required_fields)
 
-    async def remove_token(self, token: Dict[str, str]) -> bool:
-        """
-        Удаление токена из Redis по значению
-        
-        Args:
-            token: Токен для удаления (должен содержать WBTokenV3, x-supplier-id, wbx-validation-key)
-            
-        Returns:
-            bool: True если токен был найден и удален, False если не найден
-        """
-        if not self.client:
-            await self.connect()
 
-        try:
-            cursor = b'0'
-            removed = False
-            
-            while cursor:
-                cursor, keys = await self.client.scan(cursor, count=1000)
-                for key in keys:
-                    try:
-                        data = await self.client.get(key)
-                        if data is None:
-                            continue
-                            
-                        existing_token = self._decode_data(data)
-                        if (existing_token.get('WBTokenV3') == token.get('WBTokenV3') and
-                            existing_token.get('x-supplier-id') == token.get('x-supplier-id') and
-                            existing_token.get('wbx-validation-key') == token.get('wbx-validation-key')):
-                            
-                            await self.client.delete(key)
-                            logger.info(f"Removed invalid token for supplier {token.get('x-supplier-id')}")
-                            removed = True
-                            break
-                            
-                    except (ValueError, msgspec.DecodeError):
-                        continue
-                if removed:
-                    break
-                    
-            return removed
-            
-        except Exception as e:
-            logger.error(f"Failed to remove token from Redis: {str(e)}")
-            return False
 
 class ProxyClientCFFI:
     def __init__(
@@ -171,13 +132,13 @@ class ProxyClientCFFI:
         # Инициализация менеджера токенов
         self.token_manager: Optional[GetTokens] = None
         self._token_cache: List[Dict] = []
-        self.current_token_index = 0
-        self.last_token_refresh: Optional[float] = None
+        self._token_index = 0
         
         if token_redis_url:
             self.token_manager = GetTokens(token_redis_url)
             self.token_refresh_interval = token_refresh_interval
             self._token_lock = asyncio.Lock()
+            self._last_token_update: Optional[float] = None
 
     async def __aenter__(self):
         await self.start()
@@ -196,8 +157,6 @@ class ProxyClientCFFI:
     async def close(self):
         if self.session:
             await self.session.close()
-        if self.token_manager:
-            await self.token_manager.disconnect()
 
     def _build_params(self) -> dict:
         params = {}
@@ -228,15 +187,14 @@ class ProxyClientCFFI:
         async with self._token_lock:
             if self._should_refresh_tokens():
                 try:
+                    # Используем существующий класс GetTokens или напрямую подключаемся к Redis
                     new_tokens = await self.token_manager.fetch_tokens()
                     if new_tokens:
                         self._token_cache = new_tokens
-                        random.shuffle(self._token_cache)
+                        random.shuffle(self._token_cache)  # Перемешиваем для равномерного распределения
                         self.current_token_index = 0
-                        self.last_token_refresh = time.time()
+                        self.last_token_refresh = datetime.now()
                         logger.info(f"Refreshed tokens, total: {len(self._token_cache)}")
-                    else:
-                        logger.warning("No tokens available after refresh")
                 except Exception as e:
                     logger.error(f"Token refresh failed: {str(e)}")
                     if not self._token_cache:
@@ -248,7 +206,7 @@ class ProxyClientCFFI:
             return True
         if self.last_token_refresh is None:
             return True
-        elapsed = time.time() - self.last_token_refresh
+        elapsed = (datetime.now() - self.last_token_refresh).total_seconds()
         return elapsed > self.token_refresh_interval
 
     async def _get_next_token(self) -> Dict:
@@ -258,81 +216,11 @@ class ProxyClientCFFI:
         if not self._token_cache:
             raise ValueError("No available tokens")
 
+        # Циклический перебор токенов
         token = self._token_cache[self.current_token_index]
         self.current_token_index = (self.current_token_index + 1) % len(self._token_cache)
         return token
 
-    async def _remove_current_token_and_retry(self, current_token: Dict[str, str]) -> bool:
-        """
-        Удаляет невалидный токен из Redis и кеша, затем обновляет кеш
-        
-        Args:
-            current_token: Токен для удаления
-            
-        Returns:
-            bool: True если токен был удален и можно повторить попытку
-        """
-        if not self.token_manager:
-            return False
-
-        try:
-            logger.warning(f"Removing invalid token for supplier {current_token.get('x-supplier-id')}")
-            
-            # Удаляем токен из Redis
-            removed = await self.token_manager.remove_token(current_token)
-            
-            if removed:
-                # Удаляем токен из локального кеша
-                async with self._token_lock:
-                    self._token_cache = [token for token in self._token_cache 
-                                       if not (token.get('WBTokenV3') == current_token.get('WBTokenV3') and
-                                               token.get('x-supplier-id') == current_token.get('x-supplier-id') and
-                                               token.get('wbx-validation-key') == current_token.get('wbx-validation-key'))]
-                    
-                    # Сбрасываем индекс если нужно
-                    if self.current_token_index >= len(self._token_cache):
-                        self.current_token_index = 0
-                    
-                    logger.info(f"Token removed from cache. Remaining tokens: {len(self._token_cache)}")
-                
-                # Принудительно обновляем кеш для получения актуальных токенов
-                self.last_token_refresh = 0
-                await self._refresh_tokens()
-                
-                return True
-            else:
-                logger.warning("Token not found in Redis for removal")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error removing token: {str(e)}")
-            return False
-
-    async def _handle_token_error(self, current_token: Dict[str, str], status_code: int, error_msg: str) -> bool:
-        """
-        Обработка ошибок связанных с токенами
-        
-        Args:
-            current_token: Текущий использованный токен
-            status_code: HTTP статус код
-            error_msg: Сообщение об ошибке
-            
-        Returns:
-            bool: True если можно повторить запрос с новым токеном
-        """
-        # Ошибки авторизации и доступа
-        auth_errors = {401, 403, 419}
-        
-        if status_code in auth_errors:
-            logger.warning(f"Auth error {status_code} with token for supplier {current_token.get('x-supplier-id')}")
-            return await self._remove_current_token_and_retry(current_token)
-        
-        # Другие ошибки WB API которые могут быть связаны с токеном
-        elif status_code == 400 and "token" in error_msg.lower():
-            logger.warning(f"Token-related error {status_code}: {error_msg}")
-            return await self._remove_current_token_and_retry(current_token)
-            
-        return False
 
     async def request(
         self, 
@@ -352,30 +240,71 @@ class ProxyClientCFFI:
         inject_wb_token: bool = False,
         **kwargs
     ) -> Union[tuple[int, Any], Union[Struct, dict, list, None], tuple[Any, dict], Any]:
-        
+        """
+        Выполняет асинхронный HTTP-запрос с использованием ротируемых прокси.
+
+        Параметры:
+            method (str): HTTP-метод (GET, POST и т.д.)
+            url (str): Целевой URL
+            response_type (Type[Struct], optional): Класс для десериализации ответа
+            strict (bool): Строгая валидация при десериализации
+            type_return_data (str): Формат возвращаемых данных ('objects'/'dict')
+            timeout (float): Таймаут запроса в секундах
+            max_retries (int): Максимальное количество попыток
+            no_retry_statuses (Set[int]): Статус-коды без повторных попыток
+            no_retry_classes (Set[int]): Классы статус-кодов для исключения
+            base_delay (float): Базовая задержка между попытками
+            exponential_factor (float): Множитель экспоненциальной задержки
+            return_status_code (bool): Если True, возвращает кортеж (status_code, data)
+            return_cookies (bool): Если True, возвращает cookies в виде словаря
+            inject_wb_token (bool): Если True добавляет в headers авторизацию WB токенов. Необходимо добавить token_redis_url
+            **kwargs: Дополнительные параметры запроса
+
+        Возвращает:
+            При return_status_code=True и return_cookies=True: 
+                tupleUnion[tuple[int, Any], Union[Struct, dict, list, None], Any] - (status_code, data, cookies)
+            При return_status_code=True: возвращает кортеж (status_code, data)
+                где status_code - HTTP-код ответа или 0 при ошибках подключения
+                data - результат в указанном формате или None при ошибках
+                tuple[int, Any]
+            При return_cookies=True: 
+                tuple[Any, dict]
+            Иначе: Any
+
+        Исключения:
+            RequestException: При превышении максимального числа попыток
+            msgspec.DecodeError: При ошибке десериализации
+        """
+        # Инициализация декодера
         if response_type is not None:
             decoder = msgspec.json.Decoder(type=response_type, strict=strict)
         else:
             decoder = msgspec.json.Decoder()
-
+            # raw_data = msgspec.to_builtins(decoder.decode(raw_data_))
+        
+        # # Обработка параметров запроса
         method = method.upper()
         if method in {"POST", "PUT", "PATCH"}:
+            # Кодируем тело запроса с помощью msgspec
             if "params" in kwargs:
                 kwargs["data"] = msgspec.json.encode(kwargs.pop("params"))
                 if "headers" not in kwargs:
                     kwargs["headers"] = {}
                 kwargs["headers"].setdefault("Content-Type", "application/json")
         elif method in {"GET", "HEAD", "DELETE"}:
+            # Кодируем параметры URL с помощью msgspec
             if "params" in kwargs:
                 params = kwargs.pop("params")
                 kwargs["params"] = msgspec.to_builtins(params)
                 kwargs["params"] = {k: v for k, v in kwargs["params"].items() if v is not None}
 
+        # Генерация статус-кодов для классов
         status_classes = {
             4: set(range(400, 500)),
             5: set(range(500, 562))
         }
         
+        # Сбор исключенных статусов
         excluded_statuses = set()
         if no_retry_classes:
             for cls in no_retry_classes:
@@ -387,8 +316,7 @@ class ProxyClientCFFI:
         last_cookies = None
         last_status_code = None
         last_exception = None
-        current_token = None
-        
+        # Основной цикл попыток
         for attempt in range(1, max_retries + 1):
             delay = base_delay * (exponential_factor ** (attempt - 1))
             try:
@@ -399,21 +327,24 @@ class ProxyClientCFFI:
                     if not self.token_manager:
                         raise ValueError("Token manager not initialized")
                     
-                    current_token = await self._get_next_token()
+                    token = await self._get_next_token()
                     headers = kwargs.get('headers', {})
-                    
-                    if current_token:
+                    # auth_headers = await self._get_auth_headers()
+                    if token:
+                        # Формируем заголовки авторизации
                         headers.update({
                             "Cookie": (
-                                f"wbx-validation-key={current_token['wbx-validation-key']};"
-                                f"WBTokenV3={current_token['WBTokenV3']};"
-                                f"x-supplier-id-external={current_token['x-supplier-id']}"
+                                f"wbx-validation-key={token['wbx-validation-key']};"
+                                f"WBTokenV3={token['WBTokenV3']};"
+                                f"x-supplier-id-external={token['x-supplier-id']}"
                             ),
-                            "authorizev3": current_token['WBTokenV3']
+                            "authorizev3": token['WBTokenV3']
                         })
                         kwargs['headers'] = headers
                     else:
                         logger.warning("No valid tokens available for injection")
+
+                # print(kwargs['headers'])
 
                 response = await self.session.request(
                     method=method,
@@ -429,36 +360,18 @@ class ProxyClientCFFI:
                 # Обработка исключенных статусов
                 if status_code in excluded_statuses:
                     logging.warning(f"Received excluded status {status_code}")
-                    
-                    # Проверяем ошибки авторизации даже для исключенных статусов
-                    if inject_wb_token and current_token:
-                        error_text = ""
-                        try:
-                            response_data = response.json()
-                            error_text = str(response_data)
-                        except:
-                            error_text = response.text
-                            
-                        should_retry = await self._handle_token_error(current_token, status_code, error_text)
-                        if should_retry and attempt < max_retries:
-                            logging.info(f"Retrying with new token after auth error...")
-                            await asyncio.sleep(delay)
-                            continue
-                    
                     result = decoder.decode(response.content) if response.content else None
-                    return self._format_return(
-                        result, 
-                        status_code, 
-                        last_cookies,
-                        return_status_code,
-                        return_cookies
-                    )
+                    if return_status_code:
+                        return (status_code, result)
+                    return result
                 
                 response.raise_for_status()
 
+                # Сохраняем cookies
                 if return_cookies:
                     last_cookies = dict(response.cookies)
 
+                # Обработка успешного ответа
                 if response_type is not None and type_return_data == 'objects':
                     result = decoder.decode(response.content)
                 elif response_type is not None and type_return_data == 'dict':
@@ -466,6 +379,9 @@ class ProxyClientCFFI:
                 else:
                     result = decoder.decode(response.content)
                 
+                # if return_status_code:
+                #     return (status_code, result)
+                # return result
                 return self._format_return(
                     result, 
                     status_code, 
@@ -475,43 +391,31 @@ class ProxyClientCFFI:
                 )
 
             except (ProxyError, RequestException) as e:
-                status_code = 0
-                error_msg = str(e)
-                
+                # Получаем статус-код из объекта ответа
                 if hasattr(e, "response") and e.response is not None:
-                    status_code = e.response.status_code
-                    try:
-                        error_data = e.response.json()
-                        error_msg = str(error_data)
-                    except:
-                        error_msg = e.response.text
+                    last_status_code = e.response.status_code
                 else:
+                    # Парсим код из строки исключения для curl_cffi
                     error_str = str(e)
+                    status_code = 0
                     if "HTTP Error" in error_str:
                         try:
                             status_code = int(error_str.split(":")[0].split()[-1])
                         except:
                             pass
+                    last_status_code = status_code
 
-                last_status_code = status_code
                 last_exception = e
 
-                # Обработка ошибок токенов
-                if inject_wb_token and current_token:
-                    should_retry = await self._handle_token_error(current_token, status_code, error_msg)
-                    if should_retry and attempt < max_retries:
-                        logging.info(f"Retrying with new token after token error...")
-                        await asyncio.sleep(delay)
-                        continue
-
-                if status_code in excluded_statuses:
-                    logging.warning(f"Excluded status {status_code} received")
+                if last_status_code in excluded_statuses:
+                    logging.warning(f"Excluded status {last_status_code} received")
                     break
                 
+                # Сохраняем cookies из response если есть
                 if hasattr(e, "response") and e.response:
                     last_cookies = dict(e.response.cookies) if return_cookies else None
 
-                logging.warning(f"Attempt {attempt} failed: {error_msg}")
+                logging.warning(f"Attempt {attempt} failed: {str(e)}")
                 if attempt < max_retries:
                     logging.info(f"Retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
@@ -519,22 +423,32 @@ class ProxyClientCFFI:
             except msgspec.DecodeError as e:
                 logging.error(f"Decoding failed: {str(e)}")
                 last_exception = e
-                break
+                break  # Прерываем цикл при ошибке десериализации
 
             except Exception as e:
                 logging.error(f"Unexpected error: {str(e)}")
                 last_exception = e
                 raise
 
+        # Обработка результата после всех попыток
+        # if return_status_code:
+        #     return (last_status_code or 0, None)
+        
+        # if last_exception:
+        #     raise last_exception
+
+        # Обработка после всех попыток
         return self._format_return(
             None, 
             last_status_code, 
             last_cookies,
             return_status_code,
             return_cookies
-        )
-        
+        )        
+        # raise RequestException(f"Max retries ({max_retries}) exceeded")
     def _format_return(self, data, status_code, cookies, return_status, return_cookies):
+        """Форматирует возвращаемое значение в зависимости от флагов"""
+        
         if return_status and return_cookies:
             return (status_code or 0, data, cookies or {})
         if return_status:
@@ -542,3 +456,4 @@ class ProxyClientCFFI:
         if return_cookies:
             return (data, cookies or {})
         return data
+
