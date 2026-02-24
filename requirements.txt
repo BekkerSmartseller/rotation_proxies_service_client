@@ -1,4 +1,4 @@
-curl_cffi==0.7.4
-msgspec==0.18.6
-coloredlogs==15.0.1
+curl_cffi==0.14.0
+msgspec
+coloredlogs
 redis
