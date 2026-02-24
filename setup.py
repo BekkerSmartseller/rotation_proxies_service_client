@@ -1,12 +1,13 @@
+# setup.py
 from setuptools import setup, find_packages
 
 setup(
     name="wb_api_client",
-    version="0.1.8",
+    version="0.1.9",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     install_requires=[
-        "curl_cffi>=0.7.4",
+        "httpx[socks]>=0.28.1",
         "msgspec>=0.18.6",
         "coloredlogs>=15.0.1",
         "redis>=5.0.1"
