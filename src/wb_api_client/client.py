@@ -309,10 +309,6 @@ class ProxyClientHTTPX:
         inject_wb_token: bool = False,
         **kwargs
     ) -> Union[tuple[int, Any], Union[Struct, dict, list, None], tuple[Any, dict], Any]:
-        """
-        Выполняет HTTP-запрос с поддержкой прокси, токенов и повторных попыток.
-        Полностью совместим с оригинальным методом ProxyClientCFFI.request.
-        """
         # Настройка декодера
         if response_type is not None:
             decoder = msgspec.json.Decoder(type=response_type, strict=strict)
@@ -351,19 +347,20 @@ class ProxyClientHTTPX:
 
         for attempt in range(1, max_retries + 1):
             delay = base_delay * (exponential_factor ** (attempt - 1))
+            proxy_url = None
             try:
-                # Получаем прокси (может быть None, если сервис вернёт пустой URL?)
+                # Получаем прокси (используем self.client, который настроен без прокси)
                 proxy_dict = await self._get_proxy()
                 proxy_url = proxy_dict.get("https") or proxy_dict.get("http")
-                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
                 logger.info(f"Using proxy: {proxy_url} [Attempt {attempt}/{max_retries}]")
 
-                # Добавляем токен если нужно
+                # Подготавливаем заголовки и данные для запроса
+                request_kwargs = kwargs.copy()
                 if inject_wb_token:
                     if not self.token_manager:
                         raise ValueError("Token manager not initialized")
                     current_token = await self._get_next_token()
-                    headers = kwargs.get('headers', {})
+                    headers = request_kwargs.get('headers', {})
                     if current_token:
                         headers.update({
                             "Cookie": (
@@ -373,28 +370,29 @@ class ProxyClientHTTPX:
                             ),
                             "authorizev3": current_token['WBTokenV3']
                         })
-                        kwargs['headers'] = headers
+                        request_kwargs['headers'] = headers
                     else:
                         logger.warning("No valid tokens available for injection")
 
-                # Выполняем запрос через httpx
-                response = await self.client.request(
-                    method=method,
-                    url=url,
-                    proxy=proxies,
-                    timeout=timeout,
-                    **kwargs
-                )
+                # Создаём временного клиента с прокси и выполняем запрос
+                async with httpx.AsyncClient(
+                    proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+                    timeout=timeout
+                ) as client:
+                    response = await client.request(
+                        method=method,
+                        url=url,
+                        **request_kwargs
+                    )
 
                 status_code = response.status_code
                 last_status_code = status_code
                 if return_cookies:
                     last_cookies = dict(response.cookies)
 
-                # Если статус в excluded_statuses — возвращаем сразу без raise_for_status
+                # Обработка исключённых статусов
                 if status_code in excluded_statuses:
                     logger.warning(f"Received excluded status {status_code}")
-                    # Проверяем ошибки авторизации даже для исключённых статусов
                     if inject_wb_token and current_token:
                         error_text = response.text
                         should_retry = await self._handle_token_error(current_token, status_code, error_text)
@@ -402,12 +400,10 @@ class ProxyClientHTTPX:
                             logger.info("Retrying with new token after auth error...")
                             await asyncio.sleep(delay)
                             continue
-                    # Декодируем тело, если есть
                     content = response.content
                     result = decoder.decode(content) if content else None
                     return self._format_return(result, status_code, last_cookies, return_status_code, return_cookies)
 
-                # Для остальных статусов проверяем на ошибку
                 response.raise_for_status()
 
                 # Успешный ответ
@@ -422,7 +418,6 @@ class ProxyClientHTTPX:
                 return self._format_return(result, status_code, last_cookies, return_status_code, return_cookies)
 
             except httpx.ProxyError as e:
-                # Ошибка прокси (недоступен, неверный протокол и т.п.)
                 status_code = 0
                 error_msg = str(e)
                 last_status_code = status_code
@@ -438,7 +433,6 @@ class ProxyClientHTTPX:
                 if return_cookies:
                     last_cookies = dict(e.response.cookies)
 
-                # Обработка ошибок токенов
                 if inject_wb_token and current_token:
                     should_retry = await self._handle_token_error(current_token, status_code, error_msg)
                     if should_retry and attempt < max_retries:
@@ -446,13 +440,11 @@ class ProxyClientHTTPX:
                         await asyncio.sleep(delay)
                         continue
 
-                # Если статус в excluded_statuses — он уже был бы обработан выше, но здесь мы можем логировать
                 logger.warning(f"HTTP error {status_code} on attempt {attempt}: {error_msg[:200]}")
                 if attempt < max_retries:
                     logger.info(f"Retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
                 else:
-                    # Если попытки кончились, возвращаем ошибку как результат
                     content = e.response.content
                     result = decoder.decode(content) if content else None
                     return self._format_return(result, status_code, last_cookies, return_status_code, return_cookies)
@@ -467,7 +459,6 @@ class ProxyClientHTTPX:
                     await asyncio.sleep(delay)
 
             except httpx.RequestError as e:
-                # Другие ошибки запроса (сетевая проблема, DNS и т.д.)
                 status_code = 0
                 error_msg = str(e)
                 last_status_code = status_code
@@ -478,14 +469,13 @@ class ProxyClientHTTPX:
 
             except msgspec.DecodeError as e:
                 logger.error(f"Decoding failed: {str(e)}")
-                # Не повторяем, возвращаем None
                 return self._format_return(None, last_status_code, last_cookies, return_status_code, return_cookies)
 
             except Exception as e:
                 logger.error(f"Unexpected error: {str(e)}")
                 raise
 
-        # Если все попытки исчерпаны и не было успешного ответа
+        # Если все попытки исчерпаны
         return self._format_return(None, last_status_code, last_cookies, return_status_code, return_cookies)
 
     def _format_return(self, data, status_code, cookies, return_status, return_cookies):
