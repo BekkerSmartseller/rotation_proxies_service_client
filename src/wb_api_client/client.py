@@ -354,7 +354,7 @@ class ProxyClientHTTPX:
                 proxy_url = proxy_dict.get("https") or proxy_dict.get("http")
                 logger.info(f"Using proxy: {proxy_url} [Attempt {attempt}/{max_retries}]")
 
-                # Подготавливаем заголовки и данные для запроса
+                # Подготавливаем заголовки и данные
                 request_kwargs = kwargs.copy()
                 if inject_wb_token:
                     if not self.token_manager:
@@ -374,11 +374,9 @@ class ProxyClientHTTPX:
                     else:
                         logger.warning("No valid tokens available for injection")
 
-                # Создаём временного клиента с прокси и выполняем запрос
-                async with httpx.AsyncClient(
-                    proxy={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-                    timeout=timeout
-                ) as client:
+                # Создаём временного клиента с прокси (передаём строку, а не словарь)
+                proxies = proxy_url if proxy_url else None
+                async with httpx.AsyncClient(proxy=proxies, timeout=timeout) as client:
                     response = await client.request(
                         method=method,
                         url=url,
