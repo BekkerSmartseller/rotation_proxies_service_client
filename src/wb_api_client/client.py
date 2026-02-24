@@ -376,7 +376,7 @@ class ProxyClientHTTPX:
 
                 # Создаём временного клиента с прокси и выполняем запрос
                 async with httpx.AsyncClient(
-                    proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+                    proxy={"http": proxy_url, "https": proxy_url} if proxy_url else None,
                     timeout=timeout
                 ) as client:
                     response = await client.request(
