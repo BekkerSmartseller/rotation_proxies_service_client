@@ -1,1 +1,1 @@
-from .client_old import ProxyClientCFFI
+from .client_old import ProxyClientHTTPX
