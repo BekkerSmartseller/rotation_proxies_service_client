@@ -381,7 +381,7 @@ class ProxyClientHTTPX:
                 response = await self.client.request(
                     method=method,
                     url=url,
-                    proxies=proxies,
+                    proxy=proxies,
                     timeout=timeout,
                     **kwargs
                 )
