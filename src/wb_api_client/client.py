@@ -185,7 +185,8 @@ class ProxyClientHTTPX:
         """Инициализация HTTPX клиента"""
         self.client = httpx.AsyncClient(
             headers=self.headers,
-            timeout=httpx.Timeout(30.0, connect=10.0)  # базовые таймауты
+            timeout=httpx.Timeout(30.0, connect=10.0),  # базовые таймауты
+            verify=False 
         )
 
     async def close(self):
